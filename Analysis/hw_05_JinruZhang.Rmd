@@ -1,0 +1,491 @@
+---
+title: 'Web Data: APIs and Scraping'
+author: "Jinru Zhang"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    number_sections: yes
+    toc: yes
+    toc_depth: 4
+  pdf_document:
+    number_sections: yes
+    toc: no
+    toc_depth: '4'
+urlcolor: blue
+---
+
+```{r}
+require("rgdax")
+require("httr")
+require("dplyr")
+require("lubridate")
+require("quantmode")
+require("pbapply")
+require("devtools")
+# install.packages("rgdax")
+library(rgdax)
+library(keyring)
+# Set API Keys and Account ID
+library(httr)
+library(ggplot2)
+library(tidyverse)
+
+# usethis::edit_r_environ()
+# key_set("CBP_API_KEY") 
+key_get("CBP_API_KEY") 
+# key_set("CBP_PASS")
+key_get("CBP_PASS") 
+#key_set("CBP_SECRET") 
+key_get("CBP_SECRET") 
+
+# Check account balance
+AllAccts <- accounts(api.key = key_get("CBP_API_KEY") ,
+                            secret = key_get("CBP_SECRET"),
+                            passphrase = key_get("CBP_PASS"))
+
+head(AllAccts)
+```
+
+- Identify the link to instructions to obtain a key for the API
+
+
+```{r echo=T, results='hide'}
+#ETH and BTC currency price history
+ETH_Stats <- public_candles("ETH-USD", start = "2020-12-31", end = "2021-09-30",granularity = 86400)
+BTC_Stats <- public_candles("BTC-USD", start = "2020-12-31", end = "2021-09-30",granularity = 86400)
+```
+
+```{r}
+ETH_table <-  as.data.frame(fromJSON(rawToChar(ETH_Stats$content)))
+BTC_table <-  as.data.frame(fromJSON(rawToChar(BTC_Stats$content)))
+colnames(ETH_table) <- c("time", "low", "high", "open", "close", "volume")
+colnames(BTC_table) <- c("time", "low", "high", "open", "close", "volume")
+
+head(ETH_table)
+head(BTC_table)
+
+ETH_table$time <-
+  as.POSIXct(ETH_table$time, origin = "1970-01-01", tz = "GMT")
+BTC_table$time <-
+  as.POSIXct(ETH_table$time, origin = "1970-01-01", tz = "GMT")
+
+
+# Add return and cumulative return column
+ETH_table <- tibble(ETH_table) %>%
+  arrange(time)
+
+ETH_table <- ETH_table %>%
+  mutate(return = c(0,diff(ETH_table$close)/ETH_table$close[-length(ETH_table$close)]))%>%
+  mutate(cumu_ret = cumprod(1 + return))
+
+BTC_table <- tibble(BTC_table) %>% 
+  arrange(time) 
+BTC_table <- BTC_table %>%
+  mutate(return = c(0,diff(BTC_table$close)/BTC_table$close[-length(BTC_table$close)])) %>%
+  mutate(cumu_ret = cumprod(1 + return)) 
+
+ETH_BTC_cumu_ret_table <- tibble(data.frame(ETH_table$time, ETH_table$cumu_ret, BTC_table$cumu_ret))
+names(ETH_BTC_cumu_ret_table) <- c("time", "ETH_Cumu_Ret", "BTC_Cumu_Ret")
+
+ETH_BTC_cumu_ret_plot <- ETH_BTC_cumu_ret_table %>%
+  select(time, ETH_Cumu_Ret, BTC_Cumu_Ret) %>%
+  gather(key = "variable", value = "value", -time)
+head(ETH_BTC_cumu_ret_plot)
+
+ggplot(data = ETH_BTC_cumu_ret_plot, aes(x = time, y = value)) +
+  geom_line(aes(color = variable,linetype = variable))+
+  xlab("Date") + ylab("Cumulative Return") + theme_bw() +
+  ggtitle("BTC and ETH cumultive return YTD by 2021Q3") +
+  scale_color_manual(values = c("Orange", "steelblue"))
+
+```
+
+Conclusion:  From the plot, we can see ETH has cumulative return of about 300% while BTC only has cumulative return of 50%.
+
+# IMDB List of Best Foreign Films
+
+IMDB has a list of the [Top 100 Best Foreign Films](https://www.imdb.com/list/ls062615147/). This question requires scraping the following elements from the webpage and creating a tibble with all of these elements.  
+
+- Number
+- Title
+- Year
+- MPAA Rating
+- Length in minutes
+- Genre
+- Star Rating
+- Metascore Rating
+- Gross Receipts
+- Votes
+
+```{r}
+library(rvest)
+html_obj <- read_html("https://www.imdb.com/list/ls062615147/")
+hw_req_elements <- html_nodes(html_obj, 
+                              css = ".mode-detail .list-description p , .text-muted .text-muted+ span , .text-muted a:nth-child(1) , .favorable , .ipl-rating-star.small .ipl-rating-star__rating , .genre , .runtime , .certificate , .unbold , .lister-item-header a")
+tail(hw_req_elements,20)
+
+
+
+```
+
+  - b. Create a new variable with the text from each element
+```{r}
+
+
+hw_req_elements_text <- html_text(hw_req_elements)
+length(hw_req_elements_text)
+
+useful_elements <- hw_req_elements_text[130:length(hw_req_elements_text)]
+head(useful_elements,20)
+### Missing items
+length(useful_elements) # 1095 not 1200 expected
+
+```
+
+  - c. Create a tibble from the text and remove any extra white space in the text.
+```{r}
+datadf <- tibble(text = useful_elements)
+# datadf <- tibble(text = str_squish(useful_elements))
+head(datadf)
+
+#I do not want to remove extra white space in the text for now because I would like to use this as a rule to detect the information
+```
+Reason not to move extra spaces: I do not want to remove extra white space in the text for now because I would like to use this as a rule to detect the information.
+
+
+
+
+  - d. Create logical variables to uniquely identify the rows for each variable. Discard any non-movie-related data prior to the first row with movie data.
+```{r}
+### Get the movie rank,movie name,and first director only, it will be used in later stage
+ranking_elements <- html_nodes(html_obj, 
+                               css = ".text-muted a:nth-child(1) , .lister-item-header a , .text-primary")
+head(ranking_elements)
+
+# To extract the text inside the obtained nodes, use html_text()
+ranking_text <- html_text(ranking_elements)
+head(ranking_text)
+length(ranking_text)
+# tibble tidy data
+
+tibble(text = ranking_text) %>%
+  dplyr::mutate(rownum = row_number(),
+         ismovierank = rownum %% 3 == 1,
+         isname = rownum %% 3 == 2,
+         isdirector = rownum %% 3 == 0,
+         movienum = rep(1:100, each = 3)) %>%
+  select(-rownum) %>%
+  mutate(key = case_when(ismovierank ~ "rank",
+                         isname ~ "name",
+                         isdirector ~ "director_first")) %>%
+  select(key, text, movienum) %>%
+  pivot_wider(names_from = key, values_from = text) %>% 
+  select(-movienum) %>%
+  mutate(rank = parse_number(rank)) ->
+  movierank
+head(movierank)
+```
+```{r}
+# Step 1: Check if rank is missing
+# Find rules Rankings are always of the form "\\d+\\." ie: 1. , 2. , 3. ...
+# use this pattern and a cumulative sum 
+# to figure out to which movies the elements belong.
+
+datadf <- datadf %>%
+  mutate(ismovierank = str_detect(text, "^\\d+\\.$")) 
+
+head(datadf,20)
+sum(datadf$ismovierank) 
+
+## Conclusion=> Movie ranking is not missing
+
+# Add a column indicate movie id
+datadf <- datadf %>%
+  mutate(movienum = cumsum(ismovierank)) %>%
+  filter(movienum > 0)
+
+head(datadf)
+
+# Step 2: Check if movie name is missing
+# Identify movie name from the previous cleaned movierank dataframe:
+datadf <- datadf %>%
+  mutate(isname = text %in% movierank$name)
+
+sum(datadf$isname)
+
+## Conclusion=> Movie name is not missing
+
+# Step 3: Check if Year is missing
+## Years are surrounded by parentheses
+
+datadf <- datadf %>%
+  mutate(isyear = str_detect(text, "\\(\\d+\\)"))
+
+## make sure it is 100
+sum(datadf$isyear)
+
+## Conclusion=> Movie year is not missing
+
+# Step 4: Check if MPAA Rating is missing
+# 4.1 find unique MPAA Rating
+MPAA <- html_nodes(html_obj, css = ".certificate")
+MPAA <- unique(html_text(MPAA))
+
+# 4.2 add column to check if MPAA rating is missing
+datadf <- datadf %>%
+  mutate(isMPAA = text %in% MPAA)
+
+sum(datadf$isMPAA)
+
+## Conclusion=> 15 of Movie MPAA Ratings are missing
+
+# Step 5: Check if Movie length is missing
+## movie length is number + space + letters
+
+datadf <- datadf %>%
+  mutate(islength = str_detect(text, "^\\d+[:space:][:lower:]"))
+
+sum(datadf$islength)
+## Conclusion=> Movie length is not missing
+
+# Step 6: Check if Genre is missing
+## each genre begins with a new line tag
+datadf <- datadf %>%
+  mutate(isgenre = str_detect(text, "^\\n")) 
+
+## make sure it is 100
+sum(datadf$isgenre)
+
+## Conclusion=> Movie genre is not missing
+
+# Step 7: Check if imdb_score is missing
+## imdb_score: either digit+.+digit or just one digit
+## Reason it work: assume the vote is always larger than 10, so single digit will work here
+
+datadf <- datadf %>%
+  mutate(isimdb_score = str_detect(text, "^\\d\\.\\d$") | str_detect(text, "^\\d$") )
+sum(datadf$isimdb_score)         
+
+## Conclusion=> Movie imdb score is not missing
+
+
+# Step 8: Check if Metascore is missing
+## metascore start by number and has many space at end
+datadf <- datadf %>%
+  mutate(ismetascore = str_detect(text, "^\\d+\\s+$")) 
+
+sum(datadf$ismetascore) #48 of Movie Metascores are missing
+
+## Conclusion=> Movie metascore has missing of 48
+
+# Step 9: Check if votes is missing  
+## votes: either digit + , digit + , +digit or digit + , +digit
+
+datadf <- datadf %>%
+  mutate(isvote = isimdb_score != TRUE & 
+           (str_detect(text, "^\\d+\\,\\d+\\,\\d+$") | 
+           str_detect(text, "^\\d+\\,\\d+$") | 
+           str_detect(text, "^\\d+$")))
+sum(datadf$isvote)     
+
+## Conclusion=> Movie votes is not missing
+
+# Step 10: Check if gross receipt is missing 
+# Gross receipt ending by M
+datadf <- datadf %>%
+  mutate(isreceipt = str_detect(text, "M$"))
+sum(datadf$isreceipt) 
+## Conclusion=> Gross receipt has missing of 42
+
+# Step 11: Check if Country is missing 
+datadf <- datadf %>%
+  mutate(iscountry = str_detect(text, "^From"))
+sum(datadf$iscountry) 
+## Conclusion=> Country is not missing
+
+
+# Step 12: Check if First Director is missing 
+# Identify First Director from the previous cleaned movierank dataframe:
+datadf <- datadf %>%
+  mutate(isfirst_dir = text %in% movierank$director_first)
+
+sum(datadf$isfirst_dir)
+## Conclusion=> First Director is not missing
+
+head(datadf,22)
+```
+
+
+```{r}
+missing_func <- function(data){
+  return(100 - sum(data))
+}
+
+datadf %>% 
+  select(ismovierank, 
+         isname,
+         isyear,
+         isMPAA,
+         islength,
+         isgenre,
+         isimdb_score,
+         ismetascore,
+         isvote,
+         isreceipt,
+         iscountry,
+         isfirst_dir) %>%
+  dplyr::summarise(across(.fns = missing_func))
+```
+
+Metascore, Gross Receipt and MPAA Rating are missing the most from the movie.
+And the total missing is 105, matches my initial expection.
+
+
+
+```{r}
+datawide <- datadf %>%
+  mutate(key = case_when(ismovierank ~ "rank",
+                         isname ~ "name",
+                         isyear ~ "year",
+                         isMPAA ~ "MPAA",
+                         islength ~ "length",
+                         isgenre ~ "genre",
+                         isimdb_score ~ "starscore",
+                         ismetascore ~ "metacscore",
+                         isvote ~ "vote",
+                         isreceipt ~ "gross_receipts",
+                         iscountry ~ "Country",
+                         isfirst_dir ~ "first_director")) %>%
+  select(key, text, movienum) %>%
+  pivot_wider(names_from = key, values_from = text)
+
+head(datawide)
+```
+
+
+
+
+```{r}
+datawide <- datawide %>%
+  mutate(rank = parse_number(rank),
+         name = str_squish(name),
+         year = parse_number(year),
+         MPAA = as.factor(MPAA),
+         length = parse_number(length),
+         genre = str_replace_all(genre, "\\n", ""),
+         genre = str_squish(genre),
+         starscore = parse_number(starscore),
+         metacscore = parse_number(metacscore),
+         vote = parse_number(vote),
+         gross_receipts = parse_number(gross_receipts),
+         Country = as.factor(str_sub(Country, start = 6)),
+         first_director = str_squish(first_director)) %>%
+  select(-movienum)
+  
+head(datawide)
+```
+
+
+
+```{r}
+datawide %>%
+  group_by(MPAA) %>%
+  dplyr::mutate(MPAA_Count = n()) %>%
+  rowwise() %>%
+  filter(MPAA_Count >= 4) %>%
+  ggplot(aes(x = length, y = gross_receipts, color = MPAA)) +
+  geom_point() +
+  geom_smooth(formula = y ~ x, method = "lm", se = FALSE)
+```
+  
+
+It appears only for PG-13 and PG rating, there is a positive linear relationship
+between length of a film and its gross revenue.
+There are also appears to have a positive linear relationship
+between length of a film and its gross revenue for MPAA Not Rated movie.
+
+
+ 
+
+```{r}
+datawide %>%
+  group_by(MPAA) %>%
+  dplyr::mutate(MPAA_Count = n()) %>%
+  rowwise() %>%
+  filter(MPAA_Count >= 4, metacscore >= 50, metacscore <= 100) %>%
+  ggplot(aes(x = metacscore, y = starscore)) +
+  geom_point(aes( color = MPAA)) 
+```
+
+
+```{r}
+datawide %>%
+  group_by(MPAA) %>%
+  dplyr::mutate(MPAA_Count = n()) %>%
+  rowwise() %>%
+  filter(MPAA_Count >= 4, metacscore >= 50, metacscore <= 100) %>%
+  ggplot(aes(x = metacscore, y = starscore)) +
+  geom_point(aes( color = MPAA)) +
+  geom_smooth(formula = y ~ x, method = "lm", se = FALSE)
+```
+
+
+
+```{r}
+datawide_lm <-  datawide[which(datawide$metacscore >= 50),]
+lm_model <- lm(starscore~metacscore, data = datawide_lm)
+summary(lm_model)
+```
+
+I am surprised at the result since the p-value of the regression is 0.0618 > 0.05 and adjusted R
+Squared is very small at 0.0494. It means the overall model is not significantly meaningful.
+However, the plot shows there appear to be positive relationship between metascore and star score.
+
+I think it might because the variance of metascore is too large.Another reason could be there are a few outliers. For example, in the chart, I can see a few movies has quite high metascore but fairly low star score or low metascore but high star score.
+
+
+
+```{r}
+datawide %>%
+  ggplot(aes(x = vote, y = reorder(Country,vote,FUN = mean))) +geom_boxplot() + 
+  ylab("") +xlab("Votes") + ggtitle("IMDB Votes per Top 100 Foreign Films \n by Country") +
+  theme_light() 
+  
+```
+
+
+The chart ranked country by the movies average votes in the country. From the chart, we can see Brazil's movies on average has the highest votes. And a few countries including France, Italy, Spain, South Korea and Japan have a few movies has extraordinary high votes. 
+
+
+
+
+```{R}
+datawide %>%
+  group_by(first_director) %>%
+  dplyr::mutate(num_movies = n(),
+         total_gross = sum(gross_receipts, na.rm = T)) %>%
+  select(first_director,num_movies, total_gross) %>%
+  unique() %>%
+  arrange(desc(num_movies)) %>%
+  head(5)
+
+# The top 5 first directors with largest total number of movies are:
+# Park Chan-Wook, Jean-Luc Godard, Hayao Miyazaki, Federico Fellini, Pedro Almodóvar
+```
+- Identify the top 5 first directors based on their total gross and the number of movies
+
+```{R}
+datawide %>%
+  group_by(first_director) %>%
+  dplyr::mutate(num_movies = n(),
+         total_gross = sum(gross_receipts, na.rm = T)) %>%
+  select(first_director,num_movies, total_gross) %>%
+  unique() %>%
+  arrange(desc(total_gross)) %>%
+  head(5)
+# The top 5 first directors with largest total gross are:
+# Roberto Benigni, Guillermo del Toro, Jean-Pierre Jeunet, Alfonso Arau, Federico Fellini
+```
+- By just looking at the results, which director appears on both lists?
+Only director Federico Fellini appears on both lists
+
